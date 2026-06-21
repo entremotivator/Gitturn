@@ -1,103 +1,93 @@
-# Streamlit → GitHub File Uploader
+# Streamlit ZIP → GitHub Uploader
 
-A clean Streamlit app that uploads files or folders directly into a GitHub repository through the GitHub REST API.
+A Streamlit app that lets you upload a `.zip`, open and preview the files inside, then commit the extracted project into a GitHub repository.
+
+It also supports normal multi-file upload and folder upload.
 
 ## Features
 
-- GitHub API settings in the sidebar
-- Fine-grained personal access token support
-- Single/multiple file upload
-- Folder upload mode when supported by your browser and Streamlit version
-- Target folder/path control
-- Branch selector
-- Commit message control
-- Optional committer name/email
-- Existing-file overwrite toggle
-- Dry-run preview
-- Upload progress bar
-- Results table and downloadable CSV upload log
-- Safe path normalization to block unsafe paths such as `../`
+- GitHub API token/settings in the sidebar
+- Upload a ZIP project file
+- Open and preview ZIP contents before upload
+- Remove the top-level ZIP folder automatically
+- Skip junk or dangerous files by default:
+  - `.git`
+  - `node_modules`
+  - `.venv`, `venv`, `env`
+  - `__pycache__`
+  - `.DS_Store`
+  - `.streamlit/secrets.toml`
+- Upload extracted ZIP files to GitHub
+- Optional upload of the original ZIP archive too
+- One clean commit for a full project upload
+- File/folder upload tab
+- Dry-run mode
+- Upload plan CSV export
+- Upload log CSV export
+- Safe Streamlit secrets support
 
-## Files
-
-```text
-streamlit_github_uploader/
-├── app.py
-├── requirements.txt
-├── README.md
-├── .gitignore
-└── .streamlit/
-    ├── config.toml
-    └── secrets.toml.example
-```
-
-## GitHub token setup
-
-Create a GitHub fine-grained personal access token limited to the repository you want to upload into.
-
-Recommended repository permission:
-
-- **Contents: Read and write**
-
-The app uses GitHub's repository contents endpoint to create or update files. Updating an existing file requires the current file SHA, so the app checks whether a file already exists before uploading.
-
-## Local setup
+## Run locally
 
 ```bash
 cd streamlit_github_uploader
-python -m venv .venv
-source .venv/bin/activate  # Mac/Linux
-# .venv\Scripts\activate   # Windows PowerShell
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Using sidebar API fields
+## GitHub token setup
 
-Paste these values in the sidebar:
+Create a GitHub fine-grained personal access token for the target repository.
 
-- GitHub token
-- Owner, for example `octocat`
-- Repo, for example `my-streamlit-files`
-- Branch, usually `main`
-- Target folder/path, for example `uploads`, `client-files`, or `public/assets`
-- API base URL, usually `https://api.github.com`
+Minimum permission:
 
-Then upload files and click **Upload to GitHub**.
-
-## Using Streamlit secrets
-
-For local development, copy:
-
-```bash
-cp .streamlit/secrets.toml.example .streamlit/secrets.toml
+```text
+Repository permissions → Contents → Read and write
 ```
 
-Then edit `.streamlit/secrets.toml`:
+Paste the token into the sidebar, or store it in Streamlit secrets.
+
+## Streamlit secrets
+
+Create this file locally:
+
+```text
+.streamlit/secrets.toml
+```
+
+Example:
 
 ```toml
 GITHUB_TOKEN = "github_pat_your_token_here"
-GITHUB_OWNER = "your-user-or-org"
-GITHUB_REPO = "your-repo"
+GITHUB_OWNER = "your-github-username-or-org"
+GITHUB_REPO = "your-repo-name"
 GITHUB_BRANCH = "main"
-GITHUB_TARGET_FOLDER = "uploads"
+GITHUB_TARGET_FOLDER = ""
 ```
 
-Do **not** commit `.streamlit/secrets.toml` to GitHub.
+Never commit your real `secrets.toml` file.
 
-For Streamlit Community Cloud, add these values in your app's Secrets settings instead.
+## Best ZIP workflow
 
-## Deploy to Streamlit Community Cloud
+1. Put your Streamlit files in one folder.
+2. Make sure the folder includes:
 
-1. Push this project to GitHub.
-2. Go to Streamlit Community Cloud.
-3. Create a new app from the repo.
-4. Select `app.py` as the entrypoint.
-5. Add secrets in the app settings.
-6. Deploy.
+```text
+app.py
+requirements.txt
+README.md
+.streamlit/config.toml
+```
+
+3. Zip the folder.
+4. Open this app.
+5. Select the **Upload ZIP + Open** tab.
+6. Upload the ZIP.
+7. Preview the opened files.
+8. Click **Upload opened ZIP to GitHub**.
 
 ## Notes
 
-- Large files are limited by Streamlit upload limits and GitHub API/repository limits.
-- For many large files, GitHub releases, Git LFS, or cloud storage may be a better fit.
-- Folder upload depends on browser support.
+- GitHub rejects individual files larger than 100 MB.
+- The app defaults to a 25 MB individual-file limit to avoid accidental huge uploads.
+- For large projects, keep **One commit for project upload** enabled in the sidebar.
+- Do not upload `.streamlit/secrets.toml`; it is ignored by default.
