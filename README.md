@@ -1,75 +1,101 @@
-# Streamlit ZIP → GitHub Uploader
+# Direct ZIP → GitHub Streamlit Uploader
 
-A Streamlit app that lets you upload a `.zip`, open and preview the files inside, then commit the extracted project into a GitHub repository.
+A one-click Streamlit app that uploads a `.zip` project, opens it in memory, filters junk/secrets, and pushes the extracted files directly to a GitHub repository as one clean commit.
 
-It also supports normal multi-file upload and folder upload.
+This version removes the code-review step. The user selects a ZIP, fills in GitHub settings in the sidebar, and clicks **Upload ZIP to GitHub now**.
 
-## Features
+## Main features
 
-- GitHub API token/settings in the sidebar
-- Upload a ZIP project file
-- Open and preview ZIP contents before upload
-- Remove the top-level ZIP folder automatically
-- Skip junk or dangerous files by default:
+- Upload a ZIP project and push it straight to GitHub
+- GitHub token, owner, repo, branch, and target folder in the sidebar
+- Uses GitHub Git Database API for one commit instead of one commit per file
+- Can create the repository if it does not exist
+- Can create the target branch if it does not exist
+- Can overwrite existing files
+- Optional clean/replace mode for deleting old files inside the target folder before uploading
+- Removes the top ZIP folder automatically
+- Skips dangerous or unnecessary files by default:
   - `.git`
   - `node_modules`
   - `.venv`, `venv`, `env`
   - `__pycache__`
-  - `.DS_Store`
+  - build folders
+  - `.env`
   - `.streamlit/secrets.toml`
-- Upload extracted ZIP files to GitHub
-- Optional upload of the original ZIP archive too
-- One clean commit for a full project upload
-- File/folder upload tab
-- Dry-run mode
-- Upload plan CSV export
-- Upload log CSV export
-- Safe Streamlit secrets support
+  - common credential-looking files
+- Supports regular multi-file upload and browser folder upload
+- Progress bar while pushing to GitHub
+- GitHub commit link after upload
+- Uploaded file list CSV and push log CSV
+- Streamlit secrets support
+- GitHub Enterprise API base URL support
 
-## Run locally
+## Quick start
 
 ```bash
-cd streamlit_github_uploader
+cd streamlit_github_direct_pusher
+python -m venv .venv
+source .venv/bin/activate  # Mac/Linux
+# .venv\Scripts\activate   # Windows
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
 ## GitHub token setup
 
-Create a GitHub fine-grained personal access token for the target repository.
+Create a GitHub fine-grained personal access token.
 
-Minimum permission:
+For uploading to an existing repository, give the token:
 
-```text
-Repository permissions → Contents → Read and write
+- Repository access: the target repository
+- Permissions: **Contents: Read and write**
+
+For creating a new repository from the app, the token also needs permission to create repositories for the user or organization.
+
+## Streamlit secrets setup
+
+For local development, copy:
+
+```bash
+cp .streamlit/secrets.toml.example .streamlit/secrets.toml
 ```
 
-Paste the token into the sidebar, or store it in Streamlit secrets.
-
-## Streamlit secrets
-
-Create this file locally:
-
-```text
-.streamlit/secrets.toml
-```
-
-Example:
+Then edit `.streamlit/secrets.toml`:
 
 ```toml
-GITHUB_TOKEN = "github_pat_your_token_here"
-GITHUB_OWNER = "your-github-username-or-org"
+GITHUB_TOKEN = "github_pat_xxxxxxxxxxxxxxxxx"
+GITHUB_OWNER = "your-github-user-or-org"
 GITHUB_REPO = "your-repo-name"
 GITHUB_BRANCH = "main"
 GITHUB_TARGET_FOLDER = ""
 ```
 
-Never commit your real `secrets.toml` file.
+Do not commit `.streamlit/secrets.toml`.
 
-## Best ZIP workflow
+## Normal workflow
 
-1. Put your Streamlit files in one folder.
-2. Make sure the folder includes:
+1. Zip your Streamlit app or project folder.
+2. Open this app.
+3. Paste your GitHub token in the sidebar.
+4. Enter owner, repo, branch, and optional target folder.
+5. Upload the ZIP.
+6. Click **Upload ZIP to GitHub now**.
+7. Open the GitHub commit link after the push finishes.
+
+## Recommended ZIP structure
+
+Your ZIP can look like this:
+
+```text
+my-streamlit-app/
+  app.py
+  requirements.txt
+  README.md
+  .streamlit/
+    config.toml
+```
+
+With **Remove top ZIP folder** enabled, it uploads to GitHub as:
 
 ```text
 app.py
@@ -78,16 +104,49 @@ README.md
 .streamlit/config.toml
 ```
 
-3. Zip the folder.
-4. Open this app.
-5. Select the **Upload ZIP + Open** tab.
-6. Upload the ZIP.
-7. Preview the opened files.
-8. Click **Upload opened ZIP to GitHub**.
+## Target folder examples
 
-## Notes
+Leave `Target folder` blank to upload into the root of the repo.
 
-- GitHub rejects individual files larger than 100 MB.
-- The app defaults to a 25 MB individual-file limit to avoid accidental huge uploads.
-- For large projects, keep **One commit for project upload** enabled in the sidebar.
-- Do not upload `.streamlit/secrets.toml`; it is ignored by default.
+Use a folder path to upload inside a subfolder:
+
+```text
+apps/client-dashboard
+```
+
+The app will commit files like:
+
+```text
+apps/client-dashboard/app.py
+apps/client-dashboard/requirements.txt
+```
+
+## Clean/replace mode
+
+The sidebar includes **Delete old files in target folder before upload**.
+
+Use this only when you want the GitHub target folder to match the ZIP exactly. For safety, the app requires typing:
+
+```text
+CLEAN
+```
+
+before it deletes old files in the target folder.
+
+## Notes and limits
+
+- GitHub rejects individual files over 100 MB through this API path.
+- Large projects with thousands of files may be slow because every file becomes a Git blob.
+- Keep `Skip secrets / credentials` enabled unless you are absolutely sure the ZIP has no secrets.
+- The app works best for Streamlit apps, WordPress plugin ZIPs, static sites, Python projects, and small web projects.
+
+## Files in this project
+
+```text
+app.py
+requirements.txt
+README.md
+.streamlit/config.toml
+.streamlit/secrets.toml.example
+.gitignore
+```
