@@ -1,39 +1,45 @@
 # Direct ZIP → GitHub Streamlit Uploader
 
-A one-click Streamlit app that uploads a `.zip` project, opens it in memory, filters junk/secrets, and pushes the extracted files directly to a GitHub repository as one clean commit.
+A no-review Streamlit app for uploading a `.zip` project directly to GitHub.
 
-This version removes the code-review step. The user selects a ZIP, fills in GitHub settings in the sidebar, and clicks **Upload ZIP to GitHub now**.
+You choose a ZIP, click one button, and the app extracts the project, skips junk/secrets, and pushes the files to a GitHub repository.
 
-## Main features
+## What was fixed in this version
 
-- Upload a ZIP project and push it straight to GitHub
-- GitHub token, owner, repo, branch, and target folder in the sidebar
-- Uses GitHub Git Database API for one commit instead of one commit per file
-- Can create the repository if it does not exist
-- Can create the target branch if it does not exist
-- Can overwrite existing files
-- Optional clean/replace mode for deleting old files inside the target folder before uploading
+- The Direct ZIP button now performs the full action immediately.
+- New or empty repositories are handled more safely.
+- New repo creation uses `auto_init=true` so GitHub creates a default branch.
+- If an existing repo has no branch yet, the app can initialize it with the uploaded ZIP files.
+- Added a more reliable default upload engine using the GitHub Contents API.
+- Added an optional single-commit engine using the Git Database API.
+- Added clearer GitHub error messages and a connection-test tab.
+- Added better ZIP validation, ZIP corruption checks, and zip-slip path protection.
+- Added safer secret filtering.
+
+## Features
+
+- Direct `.zip` upload to GitHub
+- No code preview/review required
+- GitHub token/API fields in the sidebar
+- Owner, repo, branch, target folder, and commit message settings
+- Create repo if missing
+- Create branch if missing
+- Works better with empty/new repos
+- Compatibility upload mode for reliability
+- Single-commit upload mode for cleaner Git history
+- Overwrite existing files toggle
+- Optional clean/replace target folder mode
 - Removes the top ZIP folder automatically
-- Skips dangerous or unnecessary files by default:
-  - `.git`
-  - `node_modules`
-  - `.venv`, `venv`, `env`
-  - `__pycache__`
-  - build folders
-  - `.env`
-  - `.streamlit/secrets.toml`
-  - common credential-looking files
-- Supports regular multi-file upload and browser folder upload
-- Progress bar while pushing to GitHub
-- GitHub commit link after upload
-- Uploaded file list CSV and push log CSV
+- Skips `.git`, `node_modules`, `.venv`, `venv`, `__pycache__`, `.env`, `.streamlit/secrets.toml`, and credential-looking files
+- Direct files/folder uploader included
+- Progress bar, GitHub commit link, uploaded files link, and CSV logs
 - Streamlit secrets support
 - GitHub Enterprise API base URL support
 
 ## Quick start
 
 ```bash
-cd streamlit_github_direct_pusher
+cd streamlit_github_direct_fixed
 python -m venv .venv
 source .venv/bin/activate  # Mac/Linux
 # .venv\Scripts\activate   # Windows
@@ -41,20 +47,18 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## GitHub token setup
+## Token setup
 
 Create a GitHub fine-grained personal access token.
 
-For uploading to an existing repository, give the token:
+For normal uploading, give it:
 
-- Repository access: the target repository
-- Permissions: **Contents: Read and write**
+- Repository access to the target repository
+- Contents: Read and write
 
-For creating a new repository from the app, the token also needs permission to create repositories for the user or organization.
+To create repositories from the app, also allow the token to create repositories for your user or organization.
 
-## Streamlit secrets setup
-
-For local development, copy:
+## Local secrets setup
 
 ```bash
 cp .streamlit/secrets.toml.example .streamlit/secrets.toml
@@ -72,22 +76,26 @@ GITHUB_TARGET_FOLDER = ""
 
 Do not commit `.streamlit/secrets.toml`.
 
-## Normal workflow
+## Upload engines
 
-1. Zip your Streamlit app or project folder.
-2. Open this app.
-3. Paste your GitHub token in the sidebar.
-4. Enter owner, repo, branch, and optional target folder.
-5. Upload the ZIP.
-6. Click **Upload ZIP to GitHub now**.
-7. Open the GitHub commit link after the push finishes.
+### Compatibility mode - most reliable
+
+Default. Uses the GitHub Repository Contents API. Best when the previous direct ZIP uploader failed, especially for new repositories, branch issues, or normal small-to-medium projects.
+
+This may create more than one commit because GitHub's contents endpoint commits file-by-file.
+
+### Single commit mode - faster
+
+Uses GitHub's Git Database API to create blobs, one tree, one commit, and then update the branch reference.
+
+Use this when you want one clean commit for the whole ZIP.
 
 ## Recommended ZIP structure
 
 Your ZIP can look like this:
 
 ```text
-my-streamlit-app/
+my-app/
   app.py
   requirements.txt
   README.md
@@ -95,7 +103,7 @@ my-streamlit-app/
     config.toml
 ```
 
-With **Remove top ZIP folder** enabled, it uploads to GitHub as:
+With **Remove top ZIP folder** on, GitHub receives:
 
 ```text
 app.py
@@ -106,41 +114,34 @@ README.md
 
 ## Target folder examples
 
-Leave `Target folder` blank to upload into the root of the repo.
+Blank target folder uploads to repo root.
 
-Use a folder path to upload inside a subfolder:
+Target folder:
 
 ```text
 apps/client-dashboard
 ```
 
-The app will commit files like:
+Uploads to:
 
 ```text
 apps/client-dashboard/app.py
 apps/client-dashboard/requirements.txt
 ```
 
-## Clean/replace mode
+## Troubleshooting
 
-The sidebar includes **Delete old files in target folder before upload**.
+If upload fails:
 
-Use this only when you want the GitHub target folder to match the ZIP exactly. For safety, the app requires typing:
+1. Open the **Connection** tab and test GitHub access.
+2. Use **Compatibility mode - most reliable**.
+3. Turn on **Create repo if missing** if the repo does not exist.
+4. Leave **Create branch if missing** on.
+5. Make sure the token has **Contents: Read and write** permission.
+6. Keep individual files under 100 MB.
+7. Keep secret filtering on unless you know the ZIP is safe.
 
-```text
-CLEAN
-```
-
-before it deletes old files in the target folder.
-
-## Notes and limits
-
-- GitHub rejects individual files over 100 MB through this API path.
-- Large projects with thousands of files may be slow because every file becomes a Git blob.
-- Keep `Skip secrets / credentials` enabled unless you are absolutely sure the ZIP has no secrets.
-- The app works best for Streamlit apps, WordPress plugin ZIPs, static sites, Python projects, and small web projects.
-
-## Files in this project
+## Files
 
 ```text
 app.py

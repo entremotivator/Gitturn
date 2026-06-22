@@ -1,8 +1,7 @@
-"""Direct ZIP to GitHub Streamlit uploader.
+"""Direct ZIP -> GitHub Streamlit uploader.
 
-This app lets a non-technical user upload a .zip project and push the
-extracted files straight to GitHub with one button. It uses the GitHub Git
-Database API so a whole project can be committed as one clean commit.
+Upload a ZIP, click once, and push the extracted files straight to GitHub.
+No file review screen is required.
 """
 
 from __future__ import annotations
@@ -23,13 +22,12 @@ from urllib.parse import quote
 import requests
 import streamlit as st
 
-
-APP_VERSION = "3.0.0"
+APP_VERSION = "4.0.0"
 GITHUB_API_VERSION = "2022-11-28"
 DEFAULT_API_BASE = "https://api.github.com"
 MAX_GITHUB_FILE_BYTES = 100 * 1024 * 1024
-SAFE_BRANCH_RE = re.compile(r"^[A-Za-z0-9._\-/]+$")
 SAFE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+SAFE_BRANCH_RE = re.compile(r"^[A-Za-z0-9._\-/]+$")
 
 DEFAULT_IGNORE_DIRS = {
     ".git",
@@ -46,15 +44,9 @@ DEFAULT_IGNORE_DIRS = {
     "env",
     "node_modules",
     "bower_components",
-    "vendor",
-    "dist",
-    "build",
-    ".next",
-    ".nuxt",
+    ".next/cache",
     ".turbo",
     ".parcel-cache",
-    "coverage",
-    "htmlcov",
 }
 
 DEFAULT_IGNORE_FILES = {
@@ -71,32 +63,19 @@ DEFAULT_IGNORE_FILES = {
     "id_ed25519",
 }
 
-TEXT_EXTENSIONS = {
-    ".py",
-    ".txt",
-    ".md",
-    ".toml",
-    ".yaml",
-    ".yml",
-    ".json",
-    ".csv",
-    ".ini",
-    ".cfg",
-    ".gitignore",
-    ".html",
-    ".css",
-    ".js",
-    ".mjs",
-    ".cjs",
-    ".ts",
-    ".tsx",
-    ".jsx",
-    ".sql",
-    ".sh",
-    ".bat",
-    ".ps1",
-    ".dockerfile",
-}
+SECRET_FRAGMENTS = [
+    ".env",
+    "secrets.toml",
+    ".streamlit/secrets.toml",
+    "private_key",
+    "id_rsa",
+    "id_ed25519",
+    "credentials.json",
+    "service-account",
+    "service_account",
+    "client_secret",
+    "firebase-adminsdk",
+]
 
 
 @dataclass(frozen=True)
@@ -112,26 +91,24 @@ class RepoFile:
 
 
 @dataclass
-class ZipBuildResult:
+class ZipResult:
     files: List[RepoFile]
     skipped: List[Tuple[str, str]]
     removed_root: str
-    total_archive_entries: int
-    total_uncompressed_bytes: int
+    entry_count: int
+    total_uncompressed: int
 
 
 @dataclass
 class BranchState:
     branch: str
-    commit_sha: Optional[str]
-    tree_sha: Optional[str]
     ref_exists: bool
     empty_repo: bool
+    parent_commit_sha: Optional[str]
+    base_tree_sha: Optional[str]
 
 
 class GitHubAPIError(RuntimeError):
-    """Raised when GitHub returns a failure response."""
-
     def __init__(self, message: str, status_code: Optional[int] = None, payload: Optional[dict] = None):
         super().__init__(message)
         self.status_code = status_code
@@ -139,20 +116,19 @@ class GitHubAPIError(RuntimeError):
 
 
 class GitHubClient:
-    def __init__(self, token: str, owner: str, repo: str, api_base: str = DEFAULT_API_BASE):
+    def __init__(self, *, token: str, owner: str, repo: str, api_base: str = DEFAULT_API_BASE):
         self.token = token.strip()
         self.owner = owner.strip()
         self.repo = repo.strip()
         self.api_base = api_base.rstrip("/")
-
         if not self.token:
-            raise ValueError("GitHub token is required in the sidebar.")
+            raise ValueError("Add a GitHub token in the sidebar.")
         if not self.owner:
-            raise ValueError("Repository owner is required in the sidebar.")
+            raise ValueError("Add the GitHub owner/user/org in the sidebar.")
         if not self.repo:
-            raise ValueError("Repository name is required in the sidebar.")
+            raise ValueError("Add the GitHub repo name in the sidebar.")
         if not SAFE_REPO_RE.match(self.repo):
-            raise ValueError("Repository name can only use letters, numbers, dots, dashes, and underscores.")
+            raise ValueError("Repo name can only contain letters, numbers, dots, dashes, and underscores.")
 
     @property
     def headers(self) -> Dict[str, str]:
@@ -166,27 +142,28 @@ class GitHubClient:
         return f"{self.api_base}{path}"
 
     def _request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
-        timeout = kwargs.pop("timeout", 90)
+        timeout = kwargs.pop("timeout", 120)
         return requests.request(method, self._url(path), headers=self.headers, timeout=timeout, **kwargs)
 
-    def _json_or_text(self, resp: requests.Response) -> Dict[str, Any]:
+    @staticmethod
+    def _payload(resp: requests.Response) -> Dict[str, Any]:
         try:
             payload = resp.json()
-            if isinstance(payload, dict):
-                return payload
-            return {"message": str(payload)[:1000]}
+            return payload if isinstance(payload, dict) else {"message": str(payload)[:1000]}
         except Exception:
             return {"message": resp.text[:1000]}
 
     def _raise(self, resp: requests.Response, fallback: str) -> None:
-        payload = self._json_or_text(resp)
-        api_message = payload.get("message") or fallback
-        raise GitHubAPIError(f"{fallback} GitHub said: {api_message}", resp.status_code, payload)
+        payload = self._payload(resp)
+        message = payload.get("message") or fallback
+        doc_url = payload.get("documentation_url")
+        detail = f" {doc_url}" if doc_url else ""
+        raise GitHubAPIError(f"{fallback} GitHub said: {message}.{detail}", resp.status_code, payload)
 
     def me(self) -> Dict[str, Any]:
         resp = self._request("GET", "/user")
         if resp.status_code >= 400:
-            self._raise(resp, "Could not read the authenticated GitHub user.")
+            self._raise(resp, "Token test failed.")
         return resp.json()
 
     def get_repo(self) -> Optional[Dict[str, Any]]:
@@ -194,109 +171,113 @@ class GitHubClient:
         if resp.status_code == 404:
             return None
         if resp.status_code >= 400:
-            self._raise(resp, "Could not access the repository.")
+            self._raise(resp, "Could not access the repo.")
         return resp.json()
 
-    def ensure_repo(self, *, create_if_missing: bool, private: bool, description: str) -> Dict[str, Any]:
+    def ensure_repo(self, *, create_if_missing: bool, new_repo_private: bool) -> Dict[str, Any]:
         repo_info = self.get_repo()
         if repo_info:
             return repo_info
-
         if not create_if_missing:
             raise GitHubAPIError(
-                f"Repository {self.owner}/{self.repo} was not found. Turn on 'Create repo if missing' or create it first."
+                f"Repo {self.owner}/{self.repo} was not found. Turn on 'Create repo if missing' or create it in GitHub first."
             )
 
         user = self.me()
-        login = user.get("login", "")
+        owner_is_user = str(user.get("login", "")).lower() == self.owner.lower()
         body = {
             "name": self.repo,
-            "private": private,
-            "description": description,
-            "auto_init": False,
+            "private": bool(new_repo_private),
+            "description": "Created by Direct ZIP to GitHub Streamlit Uploader",
+            # Important: initialize the repo so GitHub has a default branch for contents uploads.
+            "auto_init": True,
         }
-
-        if self.owner.lower() == str(login).lower():
-            resp = self._request("POST", "/user/repos", json=body, timeout=120)
-        else:
-            resp = self._request("POST", f"/orgs/{self.owner}/repos", json=body, timeout=120)
-
+        path = "/user/repos" if owner_is_user else f"/orgs/{self.owner}/repos"
+        resp = self._request("POST", path, json=body, timeout=180)
         if resp.status_code >= 400:
-            self._raise(resp, "Could not create the repository.")
+            self._raise(resp, "Could not create the repo.")
         return resp.json()
 
     def get_ref(self, branch: str) -> Optional[Dict[str, Any]]:
-        encoded_branch = quote(branch, safe="/")
-        resp = self._request("GET", f"/repos/{self.owner}/{self.repo}/git/ref/heads/{encoded_branch}")
+        encoded = quote(branch, safe="/")
+        resp = self._request("GET", f"/repos/{self.owner}/{self.repo}/git/ref/heads/{encoded}")
         if resp.status_code == 404:
             return None
         if resp.status_code >= 400:
-            self._raise(resp, f"Could not read branch ref: {branch}")
+            self._raise(resp, f"Could not read branch '{branch}'.")
         return resp.json()
 
     def create_ref(self, branch: str, commit_sha: str) -> Dict[str, Any]:
-        body = {"ref": f"refs/heads/{branch}", "sha": commit_sha}
-        resp = self._request("POST", f"/repos/{self.owner}/{self.repo}/git/refs", json=body, timeout=120)
-        if resp.status_code >= 400:
-            self._raise(resp, f"Could not create branch: {branch}")
-        return resp.json()
-
-    def update_ref(self, branch: str, commit_sha: str, *, force: bool) -> Dict[str, Any]:
-        encoded_branch = quote(branch, safe="/")
-        body = {"sha": commit_sha, "force": force}
         resp = self._request(
-            "PATCH",
-            f"/repos/{self.owner}/{self.repo}/git/refs/heads/{encoded_branch}",
-            json=body,
-            timeout=120,
+            "POST",
+            f"/repos/{self.owner}/{self.repo}/git/refs",
+            json={"ref": f"refs/heads/{branch}", "sha": commit_sha},
+            timeout=180,
         )
         if resp.status_code >= 400:
-            self._raise(resp, f"Could not update branch ref: {branch}")
+            self._raise(resp, f"Could not create branch '{branch}'.")
+        return resp.json()
+
+    def update_ref(self, branch: str, commit_sha: str, *, force: bool = False) -> Dict[str, Any]:
+        encoded = quote(branch, safe="/")
+        resp = self._request(
+            "PATCH",
+            f"/repos/{self.owner}/{self.repo}/git/refs/heads/{encoded}",
+            json={"sha": commit_sha, "force": bool(force)},
+            timeout=180,
+        )
+        if resp.status_code >= 400:
+            self._raise(resp, f"Could not update branch '{branch}'.")
         return resp.json()
 
     def get_commit(self, commit_sha: str) -> Dict[str, Any]:
         resp = self._request("GET", f"/repos/{self.owner}/{self.repo}/git/commits/{commit_sha}")
         if resp.status_code >= 400:
-            self._raise(resp, f"Could not read commit: {commit_sha}")
+            self._raise(resp, "Could not read current commit.")
         return resp.json()
 
     def get_tree(self, tree_sha: str, *, recursive: bool = False) -> Dict[str, Any]:
         params = {"recursive": "1"} if recursive else None
-        resp = self._request("GET", f"/repos/{self.owner}/{self.repo}/git/trees/{tree_sha}", params=params, timeout=120)
+        resp = self._request(
+            "GET",
+            f"/repos/{self.owner}/{self.repo}/git/trees/{tree_sha}",
+            params=params,
+            timeout=180,
+        )
         if resp.status_code >= 400:
-            self._raise(resp, "Could not read Git tree.")
+            self._raise(resp, "Could not read repository tree.")
         return resp.json()
 
-    def get_branch_state(self, branch: str, repo_info: Dict[str, Any], *, create_branch_from_default: bool) -> BranchState:
+    def get_branch_state(self, branch: str, repo_info: Dict[str, Any], *, create_branch_if_missing: bool) -> BranchState:
         ref = self.get_ref(branch)
         if ref:
             commit_sha = ref.get("object", {}).get("sha")
-            if not commit_sha:
-                raise GitHubAPIError(f"Branch {branch} exists but GitHub did not return a commit SHA.")
             commit = self.get_commit(commit_sha)
             tree_sha = commit.get("tree", {}).get("sha")
-            if not tree_sha:
-                raise GitHubAPIError(f"Could not find the tree for branch {branch}.")
-            return BranchState(branch=branch, commit_sha=commit_sha, tree_sha=tree_sha, ref_exists=True, empty_repo=False)
+            return BranchState(branch, True, False, commit_sha, tree_sha)
 
         default_branch = repo_info.get("default_branch") or "main"
         default_ref = self.get_ref(default_branch)
         if default_ref:
-            if not create_branch_from_default and branch != default_branch:
-                raise GitHubAPIError(f"Branch {branch} does not exist. Turn on 'Create branch if missing'.")
             default_commit_sha = default_ref.get("object", {}).get("sha")
-            commit = self.get_commit(default_commit_sha)
-            tree_sha = commit.get("tree", {}).get("sha")
-            return BranchState(branch=branch, commit_sha=default_commit_sha, tree_sha=tree_sha, ref_exists=False, empty_repo=False)
+            default_commit = self.get_commit(default_commit_sha)
+            default_tree_sha = default_commit.get("tree", {}).get("sha")
+            if branch != default_branch and not create_branch_if_missing:
+                raise GitHubAPIError(f"Branch '{branch}' does not exist. Turn on 'Create branch if missing'.")
+            return BranchState(branch, False, False, default_commit_sha, default_tree_sha)
 
-        # Empty newly-created repo: no branch/ref exists yet.
-        return BranchState(branch=branch, commit_sha=None, tree_sha=None, ref_exists=False, empty_repo=True)
+        # Existing empty repo with no branches.
+        return BranchState(branch, False, True, None, None)
 
     def create_blob(self, content: bytes) -> str:
-        body = {"content": base64.b64encode(content).decode("utf-8"), "encoding": "base64"}
-        resp = self._request("POST", f"/repos/{self.owner}/{self.repo}/git/blobs", json=body, timeout=180)
+        resp = self._request(
+            "POST",
+            f"/repos/{self.owner}/{self.repo}/git/blobs",
+            json={"content": base64.b64encode(content).decode("utf-8"), "encoding": "base64"},
+            timeout=180,
+        )
         if resp.status_code >= 400:
-            self._raise(resp, "Could not create a Git blob.")
+            self._raise(resp, "Could not upload file blob.")
         sha = resp.json().get("sha")
         if not sha:
             raise GitHubAPIError("GitHub did not return a blob SHA.")
@@ -308,7 +289,7 @@ class GitHubClient:
             body["base_tree"] = base_tree_sha
         resp = self._request("POST", f"/repos/{self.owner}/{self.repo}/git/trees", json=body, timeout=180)
         if resp.status_code >= 400:
-            self._raise(resp, "Could not create the Git tree.")
+            self._raise(resp, "Could not create Git tree.")
         sha = resp.json().get("sha")
         if not sha:
             raise GitHubAPIError("GitHub did not return a tree SHA.")
@@ -330,13 +311,131 @@ class GitHubClient:
             body["committer"] = person
         resp = self._request("POST", f"/repos/{self.owner}/{self.repo}/git/commits", json=body, timeout=180)
         if resp.status_code >= 400:
-            self._raise(resp, "Could not create the Git commit.")
+            self._raise(resp, "Could not create Git commit.")
         payload = resp.json()
         if not payload.get("sha"):
             raise GitHubAPIError("GitHub did not return a commit SHA.")
         return payload
 
-    def direct_push(
+    def content_sha(self, path: str, branch: str) -> Optional[str]:
+        encoded_path = quote(path, safe="/")
+        resp = self._request(
+            "GET",
+            f"/repos/{self.owner}/{self.repo}/contents/{encoded_path}",
+            params={"ref": branch},
+            timeout=120,
+        )
+        if resp.status_code == 404:
+            return None
+        if resp.status_code >= 400:
+            self._raise(resp, f"Could not check existing file: {path}")
+        payload = resp.json()
+        if isinstance(payload, list):
+            raise GitHubAPIError(f"A folder already exists at this file path: {path}")
+        return payload.get("sha")
+
+    def put_content(
+        self,
+        *,
+        path: str,
+        content: bytes,
+        branch: str,
+        message: str,
+        sha: Optional[str],
+        committer_name: Optional[str],
+        committer_email: Optional[str],
+    ) -> Dict[str, Any]:
+        body: Dict[str, Any] = {
+            "message": message,
+            "content": base64.b64encode(content).decode("utf-8"),
+            "branch": branch,
+        }
+        if sha:
+            body["sha"] = sha
+        if committer_name and committer_email:
+            person = {"name": committer_name, "email": committer_email}
+            body["author"] = person
+            body["committer"] = person
+        encoded_path = quote(path, safe="/")
+        resp = self._request(
+            "PUT",
+            f"/repos/{self.owner}/{self.repo}/contents/{encoded_path}",
+            json=body,
+            timeout=180,
+        )
+        if resp.status_code >= 400:
+            self._raise(resp, f"Could not upload file: {path}")
+        return resp.json()
+
+    def direct_upload_contents_api(
+        self,
+        *,
+        files: Sequence[RepoFile],
+        branch: str,
+        commit_message: str,
+        repo_info: Dict[str, Any],
+        overwrite_existing: bool,
+        create_branch_if_missing: bool,
+        committer_name: Optional[str],
+        committer_email: Optional[str],
+        progress: Callable[[float, str], None],
+    ) -> Dict[str, Any]:
+        state = self.get_branch_state(branch, repo_info, create_branch_if_missing=create_branch_if_missing)
+        if state.empty_repo:
+            return self.direct_upload_single_commit(
+                files=files,
+                branch=branch,
+                commit_message=commit_message,
+                repo_info=repo_info,
+                overwrite_existing=overwrite_existing,
+                create_branch_if_missing=create_branch_if_missing,
+                clean_target_folder=False,
+                target_folder="",
+                force_update=False,
+                committer_name=committer_name,
+                committer_email=committer_email,
+                progress=progress,
+            )
+
+        if not state.ref_exists:
+            progress(0.03, f"Creating branch '{branch}' from the repo default branch…")
+            self.create_ref(branch, state.parent_commit_sha)  # type: ignore[arg-type]
+
+        uploaded = 0
+        skipped_existing = 0
+        latest_commit = ""
+        total = len(files)
+        for index, file in enumerate(files, start=1):
+            if file.size_bytes > MAX_GITHUB_FILE_BYTES:
+                raise GitHubAPIError(f"GitHub rejects files over 100 MB: {file.repo_path}")
+            progress(index / max(total, 1), f"Uploading {index}/{total}: {file.repo_path}")
+            sha = self.content_sha(file.repo_path, branch)
+            if sha and not overwrite_existing:
+                skipped_existing += 1
+                continue
+            result = self.put_content(
+                path=file.repo_path,
+                content=file.content,
+                branch=branch,
+                message=commit_message,
+                sha=sha,
+                committer_name=committer_name,
+                committer_email=committer_email,
+            )
+            uploaded += 1
+            latest_commit = result.get("commit", {}).get("sha", latest_commit)
+
+        return {
+            "status": "committed" if uploaded else "nothing_to_commit",
+            "engine": "compatibility_contents_api",
+            "files_uploaded": uploaded,
+            "files_skipped_existing": skipped_existing,
+            "files_deleted_first": 0,
+            "commit_sha": latest_commit,
+            "commit_url": f"https://github.com/{self.owner}/{self.repo}/commit/{latest_commit}" if latest_commit else "",
+        }
+
+    def direct_upload_single_commit(
         self,
         *,
         files: Sequence[RepoFile],
@@ -347,21 +446,16 @@ class GitHubClient:
         create_branch_if_missing: bool,
         clean_target_folder: bool,
         target_folder: str,
-        force_ref_update: bool,
+        force_update: bool,
         committer_name: Optional[str],
         committer_email: Optional[str],
-        progress: Optional[Callable[[float, str], None]] = None,
+        progress: Callable[[float, str], None],
     ) -> Dict[str, Any]:
-        if not files:
-            raise ValueError("No files were available to upload after ZIP filtering.")
-
-        state = self.get_branch_state(branch, repo_info, create_branch_from_default=create_branch_if_missing)
+        state = self.get_branch_state(branch, repo_info, create_branch_if_missing=create_branch_if_missing)
         existing_paths: set[str] = set()
-
-        if state.tree_sha:
-            if progress:
-                progress(0.02, "Reading current repository tree…")
-            tree = self.get_tree(state.tree_sha, recursive=True)
+        if state.base_tree_sha:
+            progress(0.03, "Reading existing GitHub tree…")
+            tree = self.get_tree(state.base_tree_sha, recursive=True)
             existing_paths = {
                 item.get("path", "")
                 for item in tree.get("tree", [])
@@ -369,88 +463,76 @@ class GitHubClient:
             }
 
         upload_files: List[RepoFile] = []
-        skipped_existing: List[str] = []
+        skipped_existing = 0
         for file in files:
             if file.repo_path in existing_paths and not overwrite_existing and not clean_target_folder:
-                skipped_existing.append(file.repo_path)
+                skipped_existing += 1
             else:
                 upload_files.append(file)
 
         upload_paths = {file.repo_path for file in upload_files}
         delete_items: List[Dict[str, Any]] = []
-        if state.tree_sha and clean_target_folder:
-            prefix = sanitize_folder(target_folder)
-            if prefix:
-                delete_candidates = sorted(path for path in existing_paths if path == prefix or path.startswith(prefix + "/"))
+        if clean_target_folder and state.base_tree_sha:
+            folder = sanitize_folder(target_folder)
+            if folder:
+                candidates = [p for p in existing_paths if p == folder or p.startswith(folder + "/")]
             else:
-                delete_candidates = sorted(existing_paths)
-            # Do not add a delete entry for a path that is being replaced in the same tree.
-            # The new blob entry already overwrites that path.
+                candidates = list(existing_paths)
             delete_items = [
                 {"path": path, "mode": "100644", "type": "blob", "sha": None}
-                for path in delete_candidates
+                for path in sorted(candidates)
                 if path not in upload_paths
             ]
 
         if not upload_files and not delete_items:
             return {
                 "status": "nothing_to_commit",
-                "message": "All files already exist and overwrite is off.",
+                "engine": "single_commit_git_database_api",
                 "files_uploaded": 0,
-                "files_skipped_existing": len(skipped_existing),
+                "files_skipped_existing": skipped_existing,
                 "files_deleted_first": 0,
                 "commit_sha": "",
                 "commit_url": "",
-                "tree_url": repo_tree_url(self.owner, self.repo, branch, target_folder),
             }
 
-        tree_items: List[Dict[str, Any]] = []
-        tree_items.extend(delete_items)
-
+        tree_items: List[Dict[str, Any]] = list(delete_items)
         total = len(upload_files)
-        for idx, file in enumerate(upload_files, start=1):
+        for index, file in enumerate(upload_files, start=1):
             if file.size_bytes > MAX_GITHUB_FILE_BYTES:
-                raise GitHubAPIError(f"GitHub rejects files larger than 100 MB: {file.repo_path}")
-            if progress:
-                progress(0.05 + (idx / max(total, 1)) * 0.72, f"Uploading file data {idx}/{total}: {file.repo_path}")
+                raise GitHubAPIError(f"GitHub rejects files over 100 MB: {file.repo_path}")
+            progress(0.05 + (index / max(total, 1)) * 0.75, f"Creating Git blob {index}/{total}: {file.repo_path}")
             blob_sha = self.create_blob(file.content)
             tree_items.append({"path": file.repo_path, "mode": "100644", "type": "blob", "sha": blob_sha})
 
-        if progress:
-            progress(0.82, "Creating one Git tree for the whole project…")
-        new_tree_sha = self.create_tree(tree_items, base_tree_sha=state.tree_sha)
-
-        if progress:
-            progress(0.90, "Creating one commit…")
+        progress(0.84, "Creating Git tree…")
+        tree_sha = self.create_tree(tree_items, base_tree_sha=state.base_tree_sha)
+        progress(0.92, "Creating Git commit…")
         commit = self.create_commit(
             message=commit_message,
-            tree_sha=new_tree_sha,
-            parent_sha=state.commit_sha,
+            tree_sha=tree_sha,
+            parent_sha=state.parent_commit_sha,
             committer_name=committer_name,
             committer_email=committer_email,
         )
         commit_sha = commit["sha"]
-
-        if progress:
-            progress(0.97, "Moving the GitHub branch to the new commit…")
+        progress(0.97, "Updating branch ref…")
         if state.ref_exists:
-            self.update_ref(branch, commit_sha, force=force_ref_update)
+            self.update_ref(branch, commit_sha, force=force_update)
         else:
             self.create_ref(branch, commit_sha)
 
-        if progress:
-            progress(1.0, "Upload complete.")
-
         return {
             "status": "committed",
-            "message": commit_message,
+            "engine": "single_commit_git_database_api",
             "files_uploaded": len(upload_files),
-            "files_skipped_existing": len(skipped_existing),
+            "files_skipped_existing": skipped_existing,
             "files_deleted_first": len(delete_items),
             "commit_sha": commit_sha,
             "commit_url": f"https://github.com/{self.owner}/{self.repo}/commit/{commit_sha}",
-            "tree_url": repo_tree_url(self.owner, self.repo, branch, target_folder),
         }
+
+
+# ---------- path and ZIP utilities ----------
 
 
 def get_secret(name: str, default: str = "") -> str:
@@ -461,16 +543,14 @@ def get_secret(name: str, default: str = "") -> str:
         return default
 
 
-def quote_path(path: str) -> str:
-    return "/".join(quote(part, safe="") for part in path.split("/"))
-
-
-def repo_tree_url(owner: str, repo: str, branch: str, target_folder: str = "") -> str:
-    branch_part = quote(branch, safe="/")
-    folder = sanitize_folder(target_folder)
-    if folder:
-        return f"https://github.com/{owner}/{repo}/tree/{branch_part}/{quote_path(folder)}"
-    return f"https://github.com/{owner}/{repo}/tree/{branch_part}"
+def bytes_label(num_bytes: int) -> str:
+    units = ["B", "KB", "MB", "GB"]
+    value = float(num_bytes)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{int(value)} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{num_bytes} B"
 
 
 def sanitize_folder(value: str) -> str:
@@ -480,76 +560,44 @@ def sanitize_folder(value: str) -> str:
     normalized = posixpath.normpath(value).replace("\\", "/")
     if normalized in (".", ""):
         return ""
-    if normalized.startswith("../") or normalized == ".." or "/../" in normalized:
-        raise ValueError(f"Unsafe target folder rejected: {value}")
-    if normalized.startswith("/"):
-        raise ValueError(f"Unsafe absolute target folder rejected: {value}")
+    if normalized.startswith("../") or normalized == ".." or "/../" in normalized or normalized.startswith("/"):
+        raise ValueError(f"Unsafe folder path rejected: {value}")
     return normalized
 
 
-def safe_repo_path(path: str) -> str:
-    path = str(path or "").replace("\\", "/").strip().strip("/")
-    normalized = posixpath.normpath(path).replace("\\", "/")
+def safe_repo_path(value: str) -> str:
+    value = str(value or "").replace("\\", "/").strip().strip("/")
+    normalized = posixpath.normpath(value).replace("\\", "/")
     if normalized in (".", ""):
         raise ValueError("File path cannot be empty.")
-    if normalized.startswith("../") or normalized == ".." or "/../" in normalized:
-        raise ValueError(f"Unsafe path rejected: {path}")
-    if normalized.startswith("/"):
-        raise ValueError(f"Unsafe absolute path rejected: {path}")
+    if normalized.startswith("../") or normalized == ".." or "/../" in normalized or normalized.startswith("/"):
+        raise ValueError(f"Unsafe file path rejected: {value}")
     return normalized
 
 
-def combine_repo_path(target_folder: str, relative_path: str, *, flatten: bool = False) -> str:
+def combine_repo_path(target_folder: str, relative_path: str, *, flatten_paths: bool = False) -> str:
     relative_path = str(relative_path or "").replace("\\", "/").strip("/")
-    if flatten:
+    if flatten_paths:
         relative_path = relative_path.split("/")[-1]
     folder = sanitize_folder(target_folder)
     return safe_repo_path(f"{folder}/{relative_path}" if folder else relative_path)
 
 
-def validate_branch(branch: str) -> None:
-    if not branch or not SAFE_BRANCH_RE.match(branch):
-        raise ValueError("Branch name looks invalid. Use letters, numbers, dashes, underscores, dots, or slashes.")
+def quote_path(path: str) -> str:
+    return "/".join(quote(part, safe="") for part in path.split("/"))
+
+
+def repo_tree_url(owner: str, repo: str, branch: str, target_folder: str) -> str:
+    branch_part = quote(branch, safe="/")
+    folder = sanitize_folder(target_folder)
+    if folder:
+        return f"https://github.com/{owner}/{repo}/tree/{branch_part}/{quote_path(folder)}"
+    return f"https://github.com/{owner}/{repo}/tree/{branch_part}"
 
 
 def is_zip_symlink(info: zipfile.ZipInfo) -> bool:
     file_type = (info.external_attr >> 16) & 0o170000
     return file_type == 0o120000
-
-
-def should_ignore_path(path: str, ignore_dirs: set[str], ignore_files: set[str], skip_secrets: bool) -> Tuple[bool, str]:
-    clean = path.replace("\\", "/").strip("/")
-    if not clean:
-        return True, "empty path"
-    parts = clean.split("/")
-    filename = parts[-1]
-
-    if clean.startswith("__MACOSX/") or "/__MACOSX/" in clean:
-        return True, "macOS ZIP metadata"
-    if filename in ignore_files or clean in ignore_files:
-        return True, "ignored file"
-    if filename.endswith((".pyc", ".pyo")):
-        return True, "compiled Python cache"
-    for part in parts:
-        if part in ignore_dirs:
-            return True, f"ignored folder: {part}"
-
-    lowered = clean.lower()
-    if skip_secrets:
-        secret_fragments = [
-            ".streamlit/secrets.toml",
-            "secrets.toml",
-            ".env",
-            "private_key",
-            "id_rsa",
-            "id_ed25519",
-            "credentials.json",
-            "service-account",
-            "service_account",
-        ]
-        if any(fragment in lowered for fragment in secret_fragments):
-            return True, "secret/credential-looking file"
-    return False, ""
 
 
 def parse_ignore_text(value: str) -> Tuple[set[str], set[str]]:
@@ -566,7 +614,27 @@ def parse_ignore_text(value: str) -> Tuple[set[str], set[str]]:
     return dirs, files
 
 
-def find_common_root(paths: Sequence[str]) -> str:
+def should_skip(path: str, ignore_dirs: set[str], ignore_files: set[str], skip_secrets: bool) -> Tuple[bool, str]:
+    clean = path.replace("\\", "/").strip("/")
+    if not clean:
+        return True, "empty path"
+    parts = clean.split("/")
+    filename = parts[-1]
+    if filename in ignore_files or clean in ignore_files:
+        return True, "ignored file"
+    if filename.endswith((".pyc", ".pyo")):
+        return True, "compiled Python cache"
+    for part in parts:
+        if part in ignore_dirs:
+            return True, f"ignored folder: {part}"
+    if skip_secrets:
+        lowered = clean.lower()
+        if any(fragment in lowered for fragment in SECRET_FRAGMENTS):
+            return True, "secret/credential-looking file"
+    return False, ""
+
+
+def common_top_folder(paths: Sequence[str]) -> str:
     if not paths:
         return ""
     first = paths[0].split("/")[0]
@@ -577,46 +645,44 @@ def find_common_root(paths: Sequence[str]) -> str:
     return ""
 
 
-def strip_common_root(path: str, common_root: str) -> str:
-    if common_root and path.startswith(common_root + "/"):
-        return path[len(common_root) + 1 :]
+def strip_root(path: str, root: str) -> str:
+    if root and path.startswith(root + "/"):
+        return path[len(root) + 1 :]
     return path
 
 
-def bytes_label(num_bytes: int) -> str:
-    units = ["B", "KB", "MB", "GB"]
-    value = float(num_bytes)
-    for unit in units:
-        if value < 1024 or unit == units[-1]:
-            return f"{int(value)} {unit}" if unit == "B" else f"{value:.1f} {unit}"
-        value /= 1024
-    return f"{num_bytes} B"
-
-
-def build_zip_files(
+def extract_zip_to_files(
     *,
     zip_bytes: bytes,
     zip_name: str,
     target_folder: str,
     strip_top_folder: bool,
     flatten_paths: bool,
+    skip_secrets: bool,
     ignore_dirs: set[str],
     ignore_files: set[str],
-    skip_secrets: bool,
     max_file_mb: int,
     max_total_mb: int,
     max_files: int,
-    include_original_zip: bool,
-) -> ZipBuildResult:
+) -> ZipResult:
     files: List[RepoFile] = []
     skipped: List[Tuple[str, str]] = []
-    max_file_bytes = max(1, int(max_file_mb)) * 1024 * 1024
-    max_total_bytes = max(1, int(max_total_mb)) * 1024 * 1024
-    total_uncompressed = 0
+    max_file_bytes = int(max_file_mb) * 1024 * 1024
+    max_total_bytes = int(max_total_mb) * 1024 * 1024
 
-    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    except zipfile.BadZipFile:
+        raise ValueError("This file is not a valid ZIP archive.")
+
+    with zf:
+        bad_member = zf.testzip()
+        if bad_member:
+            raise ValueError(f"ZIP appears corrupted around: {bad_member}")
+
         infos = zf.infolist()
-        valid_archive_paths: List[str] = []
+        valid_paths: List[str] = []
+        total_uncompressed = 0
 
         for info in infos:
             raw = info.filename.replace("\\", "/").strip("/")
@@ -625,7 +691,7 @@ def build_zip_files(
             if is_zip_symlink(info):
                 skipped.append((raw, "symbolic link skipped"))
                 continue
-            ignored, reason = should_ignore_path(raw, ignore_dirs, ignore_files, skip_secrets)
+            ignored, reason = should_skip(raw, ignore_dirs, ignore_files, skip_secrets)
             if ignored:
                 skipped.append((raw, reason))
                 continue
@@ -635,76 +701,54 @@ def build_zip_files(
                 skipped.append((raw, str(exc)))
                 continue
             if info.file_size > max_file_bytes:
-                skipped.append((raw, f"file is larger than {max_file_mb} MB"))
+                skipped.append((raw, f"larger than {max_file_mb} MB limit"))
                 continue
             if info.file_size > MAX_GITHUB_FILE_BYTES:
-                skipped.append((raw, "GitHub file limit is 100 MB"))
+                skipped.append((raw, "GitHub API file limit is 100 MB"))
                 continue
-            valid_archive_paths.append(raw)
+            valid_paths.append(raw)
             total_uncompressed += int(info.file_size)
 
-        if len(valid_archive_paths) > max_files:
-            raise ValueError(f"ZIP has {len(valid_archive_paths):,} uploadable files. Limit is {max_files:,}.")
+        if len(valid_paths) > int(max_files):
+            raise ValueError(f"ZIP has {len(valid_paths):,} uploadable files. Increase Max files or remove files from the ZIP.")
         if total_uncompressed > max_total_bytes:
             raise ValueError(
-                f"ZIP expands to {bytes_label(total_uncompressed)}, which is over the {max_total_mb} MB safety limit."
+                f"ZIP expands to {bytes_label(total_uncompressed)}, over the {max_total_mb} MB safety limit."
             )
 
-        common_root = find_common_root(valid_archive_paths) if strip_top_folder else ""
-        seen_repo_paths: set[str] = set()
-
+        root = common_top_folder(valid_paths) if strip_top_folder else ""
+        seen: set[str] = set()
+        valid_set = set(valid_paths)
         for info in infos:
             raw = info.filename.replace("\\", "/").strip("/")
-            if not raw or info.is_dir() or is_zip_symlink(info):
+            if not raw or info.is_dir() or raw not in valid_set:
                 continue
-            ignored, _reason = should_ignore_path(raw, ignore_dirs, ignore_files, skip_secrets)
-            if ignored:
-                continue
-            if raw not in valid_archive_paths:
-                continue
-
-            rel = strip_common_root(raw, common_root)
+            rel = strip_root(raw, root)
             if not rel:
                 skipped.append((raw, "top folder only"))
                 continue
-
-            try:
-                content = zf.read(info)
-                repo_path = combine_repo_path(target_folder, rel, flatten=flatten_paths)
-            except Exception as exc:
-                skipped.append((raw, str(exc)))
-                continue
-
-            if repo_path in seen_repo_paths:
-                root, ext = os.path.splitext(repo_path)
-                repo_path = f"{root}-{len(seen_repo_paths) + 1}{ext}"
-            seen_repo_paths.add(repo_path)
+            content = zf.read(info)
+            repo_path = combine_repo_path(target_folder, rel, flatten_paths=flatten_paths)
+            if repo_path in seen:
+                base, ext = os.path.splitext(repo_path)
+                repo_path = f"{base}-{len(seen) + 1}{ext}"
+            seen.add(repo_path)
             files.append(RepoFile(archive_path=raw, repo_path=repo_path, content=content, source=zip_name))
 
-    if include_original_zip:
-        archive_path = combine_repo_path("archives", zip_name, flatten=True)
-        files.append(RepoFile(archive_path=zip_name, repo_path=archive_path, content=zip_bytes, source="original ZIP archive"))
-
-    return ZipBuildResult(
-        files=files,
-        skipped=skipped,
-        removed_root=common_root,
-        total_archive_entries=len(infos),
-        total_uncompressed_bytes=total_uncompressed,
-    )
+    return ZipResult(files, skipped, root, len(infos), total_uncompressed)
 
 
-def make_files_from_uploads(uploaded_files: Iterable[Any], target_folder: str, flatten_paths: bool) -> List[RepoFile]:
+def uploaded_files_to_repo_files(uploaded: Iterable[Any], target_folder: str, flatten_paths: bool) -> List[RepoFile]:
     files: List[RepoFile] = []
     seen: set[str] = set()
-    for item in uploaded_files:
+    for item in uploaded:
         content = item.getvalue()
-        repo_path = combine_repo_path(target_folder, item.name, flatten=flatten_paths)
+        repo_path = combine_repo_path(target_folder, item.name, flatten_paths=flatten_paths)
         if len(content) > MAX_GITHUB_FILE_BYTES:
-            raise ValueError(f"GitHub rejects files larger than 100 MB: {item.name}")
+            raise ValueError(f"GitHub rejects files over 100 MB: {item.name}")
         if repo_path in seen:
-            root, ext = os.path.splitext(repo_path)
-            repo_path = f"{root}-{len(seen) + 1}{ext}"
+            base, ext = os.path.splitext(repo_path)
+            repo_path = f"{base}-{len(seen) + 1}{ext}"
         seen.add(repo_path)
         files.append(RepoFile(archive_path=item.name, repo_path=repo_path, content=content, source="browser upload"))
     return files
@@ -727,7 +771,7 @@ def files_csv(files: Sequence[RepoFile]) -> bytes:
     return buffer.getvalue().encode("utf-8")
 
 
-def push_log_csv(result: Dict[str, Any]) -> bytes:
+def result_csv(result: Dict[str, Any]) -> bytes:
     buffer = io.StringIO()
     writer = csv.DictWriter(buffer, fieldnames=list(result.keys()))
     writer.writeheader()
@@ -735,80 +779,78 @@ def push_log_csv(result: Dict[str, Any]) -> bytes:
     return buffer.getvalue().encode("utf-8")
 
 
-def sidebar_settings() -> Dict[str, Any]:
+# ---------- Streamlit UI ----------
+
+
+def sidebar() -> Dict[str, Any]:
     st.sidebar.title("GitHub API")
-    st.sidebar.caption("Paste a GitHub token here or store it as `GITHUB_TOKEN` in Streamlit secrets.")
+    st.sidebar.caption("Token stays in your running app. Use Streamlit secrets for deployment.")
 
     token = st.sidebar.text_input("GitHub token", value=get_secret("GITHUB_TOKEN", ""), type="password")
-
-    col1, col2 = st.sidebar.columns(2)
-    with col1:
-        owner = st.text_input("Owner", value=get_secret("GITHUB_OWNER", ""), placeholder="your-user-or-org")
-    with col2:
-        repo = st.text_input("Repo", value=get_secret("GITHUB_REPO", ""), placeholder="my-streamlit-app")
-
+    owner = st.sidebar.text_input("Owner / org", value=get_secret("GITHUB_OWNER", ""), placeholder="your-github-user")
+    repo = st.sidebar.text_input("Repository", value=get_secret("GITHUB_REPO", ""), placeholder="my-streamlit-app")
     branch = st.sidebar.text_input("Branch", value=get_secret("GITHUB_BRANCH", "main"))
-    target_folder = st.sidebar.text_input("Target folder", value=get_secret("GITHUB_TARGET_FOLDER", ""), help="Leave blank for repo root.")
-    api_base = st.sidebar.text_input("API base", value=get_secret("GITHUB_API_BASE", DEFAULT_API_BASE))
+    target_folder = st.sidebar.text_input("Target folder", value=get_secret("GITHUB_TARGET_FOLDER", ""), help="Blank = repo root")
+    api_base = st.sidebar.text_input("API base URL", value=get_secret("GITHUB_API_BASE", DEFAULT_API_BASE))
 
-    with st.sidebar.expander("Direct upload options", expanded=True):
+    with st.sidebar.expander("Upload behavior", expanded=True):
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        commit_message = st.text_input("Commit message", value=f"Upload project from Streamlit - {now}")
+        commit_message = st.text_input("Commit message", value=f"Direct ZIP upload - {now}")
+        engine = st.radio(
+            "Upload engine",
+            ["Compatibility mode - most reliable", "Single commit mode - faster"],
+            index=0,
+            help="Compatibility uses GitHub Contents API. Single commit uses Git Database API.",
+        )
         overwrite_existing = st.checkbox("Overwrite matching files", value=True)
-        create_branch_if_missing = st.checkbox("Create branch if missing", value=True)
         create_repo_if_missing = st.checkbox("Create repo if missing", value=False)
+        create_branch_if_missing = st.checkbox("Create branch if missing", value=True)
         new_repo_private = st.checkbox("New repo private", value=True)
-        force_ref_update = st.checkbox("Force branch update if GitHub rejects fast-forward", value=False)
 
-    with st.sidebar.expander("ZIP extraction", expanded=False):
+    with st.sidebar.expander("ZIP cleanup", expanded=True):
         strip_top_folder = st.checkbox("Remove top ZIP folder", value=True)
-        flatten_paths = st.checkbox("Flatten all paths", value=False)
+        flatten_paths = st.checkbox("Flatten paths", value=False)
         skip_secrets = st.checkbox("Skip secrets / credentials", value=True)
-        include_original_zip = st.checkbox("Also upload original ZIP to /archives", value=False)
-        max_file_mb = st.number_input("Max file MB", min_value=1, max_value=100, value=50, step=1)
-        max_total_mb = st.number_input("Max extracted total MB", min_value=10, max_value=5000, value=500, step=10)
-        max_files = st.number_input("Max files", min_value=1, max_value=10000, value=1000, step=50)
+        max_file_mb = st.number_input("Max single file MB", 1, 100, 50, 1)
+        max_total_mb = st.number_input("Max extracted total MB", 10, 5000, 500, 10)
+        max_files = st.number_input("Max files", 1, 20000, 3000, 50)
 
-    with st.sidebar.expander("Clean/replace mode", expanded=False):
-        st.warning("Only use this when you want to replace an existing target folder.")
-        clean_target_folder = st.checkbox("Delete old files in target folder before upload", value=False)
-        clean_confirmation = st.text_input("Type CLEAN to allow delete", value="", disabled=not clean_target_folder)
+    with st.sidebar.expander("Clean replace mode", expanded=False):
+        st.caption("Only works with Single commit mode. It deletes old files in the target folder before upload.")
+        clean_target_folder = st.checkbox("Delete old target folder files first", value=False)
+        clean_confirmation = st.text_input("Type CLEAN", value="", disabled=not clean_target_folder)
+        force_update = st.checkbox("Force branch update", value=False)
 
     with st.sidebar.expander("Committer", expanded=False):
         committer_name = st.text_input("Committer name", value=get_secret("GITHUB_COMMITTER_NAME", ""))
         committer_email = st.text_input("Committer email", value=get_secret("GITHUB_COMMITTER_EMAIL", ""))
 
-    with st.sidebar.expander("Ignored folders/files", expanded=False):
-        ignore_text = st.text_area(
-            "One item per line",
-            value="\n".join(sorted(DEFAULT_IGNORE_DIRS | DEFAULT_IGNORE_FILES)),
-            height=220,
-        )
+    with st.sidebar.expander("Ignore list", expanded=False):
+        ignore_text = st.text_area("Ignored folders/files", value="\n".join(sorted(DEFAULT_IGNORE_DIRS | DEFAULT_IGNORE_FILES)), height=220)
 
     ignore_dirs, ignore_files = parse_ignore_text(ignore_text)
-
     return {
         "token": token,
         "owner": owner,
         "repo": repo,
-        "branch": branch,
+        "branch": branch.strip(),
         "target_folder": target_folder,
         "api_base": api_base,
         "commit_message": commit_message,
+        "engine": engine,
         "overwrite_existing": overwrite_existing,
-        "create_branch_if_missing": create_branch_if_missing,
         "create_repo_if_missing": create_repo_if_missing,
+        "create_branch_if_missing": create_branch_if_missing,
         "new_repo_private": new_repo_private,
-        "force_ref_update": force_ref_update,
         "strip_top_folder": strip_top_folder,
         "flatten_paths": flatten_paths,
         "skip_secrets": skip_secrets,
-        "include_original_zip": include_original_zip,
         "max_file_mb": int(max_file_mb),
         "max_total_mb": int(max_total_mb),
         "max_files": int(max_files),
         "clean_target_folder": clean_target_folder,
         "clean_confirmation": clean_confirmation,
+        "force_update": force_update,
         "committer_name": committer_name.strip() or None,
         "committer_email": committer_email.strip() or None,
         "ignore_dirs": ignore_dirs,
@@ -817,259 +859,246 @@ def sidebar_settings() -> Dict[str, Any]:
 
 
 def validate_settings(settings: Dict[str, Any]) -> None:
-    validate_branch(settings["branch"])
+    if not settings["branch"] or not SAFE_BRANCH_RE.match(settings["branch"]):
+        raise ValueError("Branch name looks invalid.")
     sanitize_folder(settings["target_folder"])
-    if settings["clean_target_folder"] and settings["clean_confirmation"].strip().upper() != "CLEAN":
-        raise ValueError("Clean/replace mode is on. Type CLEAN in the sidebar before uploading.")
+    if settings["clean_target_folder"]:
+        if settings["engine"].startswith("Compatibility"):
+            raise ValueError("Clean replace mode needs 'Single commit mode - faster'.")
+        if settings["clean_confirmation"].strip().upper() != "CLEAN":
+            raise ValueError("Type CLEAN in the sidebar to use clean replace mode.")
 
 
-def render_push_result(result: Dict[str, Any]) -> None:
-    if result.get("status") == "nothing_to_commit":
-        st.warning(result.get("message", "Nothing changed."))
-    else:
-        st.success("Uploaded to GitHub successfully.")
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Files uploaded", int(result.get("files_uploaded", 0)))
-    c2.metric("Skipped existing", int(result.get("files_skipped_existing", 0)))
-    c3.metric("Deleted first", int(result.get("files_deleted_first", 0)))
-
-    commit_url = result.get("commit_url")
-    tree_url = result.get("tree_url")
-    if commit_url:
-        st.link_button("Open GitHub commit", commit_url, use_container_width=False)
-    if tree_url:
-        st.link_button("Open uploaded files on GitHub", tree_url, use_container_width=False)
-
-    st.download_button(
-        "Download GitHub push log CSV",
-        data=push_log_csv(result),
-        file_name="github_push_log.csv",
-        mime="text/csv",
-    )
-
-
-def push_files_now(files: Sequence[RepoFile], settings: Dict[str, Any]) -> Dict[str, Any]:
+def make_client(settings: Dict[str, Any]) -> GitHubClient:
     validate_settings(settings)
-    client = GitHubClient(
+    return GitHubClient(
         token=settings["token"],
         owner=settings["owner"],
         repo=settings["repo"],
         api_base=settings["api_base"],
     )
 
+
+def direct_push(files: Sequence[RepoFile], settings: Dict[str, Any]) -> Dict[str, Any]:
+    if not files:
+        raise ValueError("No files available to upload after filtering.")
+    client = make_client(settings)
     repo_info = client.ensure_repo(
         create_if_missing=settings["create_repo_if_missing"],
-        private=settings["new_repo_private"],
-        description="Uploaded from Streamlit ZIP to GitHub Direct Pusher",
+        new_repo_private=settings["new_repo_private"],
     )
 
     progress = st.progress(0, text="Starting GitHub upload…")
 
-    def update_progress(percent: float, text: str) -> None:
+    def update(percent: float, text: str) -> None:
         progress.progress(max(0.0, min(float(percent), 1.0)), text=text)
 
     try:
-        result = client.direct_push(
-            files=files,
-            branch=settings["branch"],
-            commit_message=settings["commit_message"],
-            repo_info=repo_info,
-            overwrite_existing=settings["overwrite_existing"],
-            create_branch_if_missing=settings["create_branch_if_missing"],
-            clean_target_folder=settings["clean_target_folder"],
-            target_folder=settings["target_folder"],
-            force_ref_update=settings["force_ref_update"],
-            committer_name=settings["committer_name"],
-            committer_email=settings["committer_email"],
-            progress=update_progress,
-        )
+        if settings["engine"].startswith("Compatibility"):
+            result = client.direct_upload_contents_api(
+                files=files,
+                branch=settings["branch"],
+                commit_message=settings["commit_message"],
+                repo_info=repo_info,
+                overwrite_existing=settings["overwrite_existing"],
+                create_branch_if_missing=settings["create_branch_if_missing"],
+                committer_name=settings["committer_name"],
+                committer_email=settings["committer_email"],
+                progress=update,
+            )
+        else:
+            result = client.direct_upload_single_commit(
+                files=files,
+                branch=settings["branch"],
+                commit_message=settings["commit_message"],
+                repo_info=repo_info,
+                overwrite_existing=settings["overwrite_existing"],
+                create_branch_if_missing=settings["create_branch_if_missing"],
+                clean_target_folder=settings["clean_target_folder"],
+                target_folder=settings["target_folder"],
+                force_update=settings["force_update"],
+                committer_name=settings["committer_name"],
+                committer_email=settings["committer_email"],
+                progress=update,
+            )
+        result["repo"] = f"{settings['owner']}/{settings['repo']}"
+        result["branch"] = settings["branch"]
+        result["target_folder"] = sanitize_folder(settings["target_folder"])
+        result["tree_url"] = repo_tree_url(settings["owner"], settings["repo"], settings["branch"], settings["target_folder"])
         return result
     finally:
-        time.sleep(0.2)
+        time.sleep(0.25)
         progress.empty()
 
 
-def direct_zip_page(settings: Dict[str, Any]) -> None:
-    st.subheader("Direct ZIP upload")
-    st.write("Upload a ZIP, click once, and the extracted project is pushed to GitHub. No code review screen required.")
+def show_result(result: Dict[str, Any], files: Sequence[RepoFile], skipped: Optional[Sequence[Tuple[str, str]]] = None, removed_root: str = "") -> None:
+    if result.get("status") == "nothing_to_commit":
+        st.warning("Nothing changed. Existing files were skipped because overwrite is off.")
+    else:
+        st.success("Direct upload complete.")
 
-    zip_file = st.file_uploader("Upload project ZIP", type=["zip"], accept_multiple_files=False)
-    if not zip_file:
-        st.info("Choose a `.zip` file to send it directly to GitHub.")
+    a, b, c, d = st.columns(4)
+    a.metric("Uploaded", int(result.get("files_uploaded", 0)))
+    b.metric("Skipped existing", int(result.get("files_skipped_existing", 0)))
+    c.metric("Deleted first", int(result.get("files_deleted_first", 0)))
+    d.metric("Engine", "Compat" if "contents" in result.get("engine", "") else "Single")
+
+    if result.get("commit_url"):
+        st.link_button("Open GitHub commit", result["commit_url"])
+    if result.get("tree_url"):
+        st.link_button("Open uploaded files", result["tree_url"])
+
+    st.download_button("Download upload log CSV", data=result_csv(result), file_name="github_upload_log.csv", mime="text/csv")
+    st.download_button("Download uploaded file list CSV", data=files_csv(files), file_name="github_uploaded_files.csv", mime="text/csv")
+
+    with st.expander("Upload details", expanded=False):
+        if removed_root:
+            st.write(f"Removed top ZIP folder: `{removed_root}/`")
+        st.write(f"Prepared {len(files):,} file(s), {bytes_label(sum(f.size_bytes for f in files))}.")
+        if skipped:
+            st.write(f"Skipped {len(skipped):,} file(s).")
+            st.dataframe([{"file": f, "reason": r} for f, r in skipped], hide_index=True, use_container_width=True)
+
+
+def direct_zip_tab(settings: Dict[str, Any]) -> None:
+    st.header("Direct ZIP upload")
+    st.caption("Upload a ZIP and click one button. The app opens it, filters junk/secrets, and pushes files to GitHub immediately.")
+
+    uploaded_zip = st.file_uploader("Choose project ZIP", type=["zip"], accept_multiple_files=False)
+    if not uploaded_zip:
+        st.info("Choose a `.zip` file to start.")
         return
 
-    zip_bytes = zip_file.getvalue()
-    c1, c2 = st.columns(2)
-    c1.metric("ZIP file", zip_file.name)
-    c2.metric("ZIP size", bytes_label(len(zip_bytes)))
+    zip_bytes = uploaded_zip.getvalue()
+    col1, col2, col3 = st.columns(3)
+    col1.metric("ZIP name", uploaded_zip.name)
+    col2.metric("ZIP size", bytes_label(len(zip_bytes)))
+    col3.metric("Destination", f"{settings['owner'] or 'owner'}/{settings['repo'] or 'repo'}")
 
-    button_label = "Upload ZIP to GitHub now"
-    if st.button(button_label, type="primary", use_container_width=True):
+    if st.button("Upload ZIP directly to GitHub", type="primary", use_container_width=True):
         try:
-            with st.spinner("Opening ZIP and preparing files…"):
-                build = build_zip_files(
+            with st.spinner("Opening ZIP and preparing direct upload…"):
+                build = extract_zip_to_files(
                     zip_bytes=zip_bytes,
-                    zip_name=zip_file.name,
+                    zip_name=uploaded_zip.name,
                     target_folder=settings["target_folder"],
                     strip_top_folder=settings["strip_top_folder"],
                     flatten_paths=settings["flatten_paths"],
+                    skip_secrets=settings["skip_secrets"],
                     ignore_dirs=settings["ignore_dirs"],
                     ignore_files=settings["ignore_files"],
-                    skip_secrets=settings["skip_secrets"],
                     max_file_mb=settings["max_file_mb"],
                     max_total_mb=settings["max_total_mb"],
                     max_files=settings["max_files"],
-                    include_original_zip=settings["include_original_zip"],
                 )
-
             if not build.files:
-                st.error("No files were uploadable after ZIP filtering.")
+                st.error("No uploadable files were found inside the ZIP after filtering.")
                 if build.skipped:
-                    with st.expander("Skipped files"):
-                        st.dataframe([{"File": f, "Reason": r} for f, r in build.skipped], hide_index=True, use_container_width=True)
+                    st.dataframe([{"file": f, "reason": r} for f, r in build.skipped], hide_index=True, use_container_width=True)
                 return
-
-            st.caption(
-                f"Prepared {len(build.files):,} file(s), {bytes_label(sum(f.size_bytes for f in build.files))}. "
-                f"Skipped {len(build.skipped):,}."
-            )
-            result = push_files_now(build.files, settings)
-            render_push_result(result)
-
-            with st.expander("Upload summary", expanded=False):
-                if build.removed_root:
-                    st.write(f"Removed top ZIP folder: `{build.removed_root}/`")
-                st.download_button(
-                    "Download uploaded file list CSV",
-                    data=files_csv(build.files),
-                    file_name="github_uploaded_files.csv",
-                    mime="text/csv",
-                )
-                if build.skipped:
-                    st.dataframe(
-                        [{"Skipped file": f, "Reason": r} for f, r in build.skipped],
-                        hide_index=True,
-                        use_container_width=True,
-                    )
+            result = direct_push(build.files, settings)
+            show_result(result, build.files, build.skipped, build.removed_root)
         except Exception as exc:
             st.error(str(exc))
+            with st.expander("What to check"):
+                st.markdown(
+                    """
+- Make sure the GitHub token has **Contents: Read and write** permission for the repo.
+- Turn on **Create repo if missing** if the repo does not exist.
+- If your repo is empty or brand new, leave **Create branch if missing** on.
+- If the target folder already has files, keep **Overwrite matching files** on.
+- Try **Compatibility mode - most reliable** first.
+                    """
+                )
 
 
-def folder_file_page(settings: Dict[str, Any]) -> None:
-    st.subheader("Direct files/folder upload")
-    st.write("Use this when you do not have a ZIP. It also uploads directly without code preview.")
-
+def files_tab(settings: Dict[str, Any]) -> None:
+    st.header("Direct file/folder upload")
     mode = st.radio("Upload type", ["Multiple files", "Folder"], horizontal=True)
-    kwargs: Dict[str, Any] = {
-        "label": "Choose files" if mode == "Multiple files" else "Choose folder",
-        "accept_multiple_files": True if mode == "Multiple files" else "directory",
-    }
-    uploaded = st.file_uploader(**kwargs)
+    uploaded = st.file_uploader(
+        "Choose files" if mode == "Multiple files" else "Choose folder",
+        accept_multiple_files=True if mode == "Multiple files" else "directory",
+    )
     if not uploaded:
-        st.info("Choose files or a folder to upload.")
+        st.info("Choose files or a folder.")
         return
-
-    if st.button("Upload selected files to GitHub now", type="primary", use_container_width=True):
+    if st.button("Upload selected files directly to GitHub", type="primary", use_container_width=True):
         try:
-            files = make_files_from_uploads(uploaded, settings["target_folder"], settings["flatten_paths"])
-            st.caption(f"Prepared {len(files):,} file(s), {bytes_label(sum(f.size_bytes for f in files))}.")
-            result = push_files_now(files, settings)
-            render_push_result(result)
-            with st.expander("Upload summary", expanded=False):
-                st.download_button(
-                    "Download uploaded file list CSV",
-                    data=files_csv(files),
-                    file_name="github_uploaded_files.csv",
-                    mime="text/csv",
-                )
+            files = uploaded_files_to_repo_files(uploaded, settings["target_folder"], settings["flatten_paths"])
+            result = direct_push(files, settings)
+            show_result(result, files)
         except Exception as exc:
             st.error(str(exc))
 
 
-def connection_page(settings: Dict[str, Any]) -> None:
-    st.subheader("Connection check")
-    st.write("Use this once to confirm the token can reach the selected repository.")
+def connection_tab(settings: Dict[str, Any]) -> None:
+    st.header("Connection check")
+    st.write("Use this to test token, repo, and branch access before uploading.")
     if st.button("Test GitHub connection", type="primary"):
         try:
-            validate_settings(settings)
-            client = GitHubClient(settings["token"], settings["owner"], settings["repo"], settings["api_base"])
-            repo = client.ensure_repo(
+            client = make_client(settings)
+            user = client.me()
+            repo_info = client.ensure_repo(
                 create_if_missing=settings["create_repo_if_missing"],
-                private=settings["new_repo_private"],
-                description="Uploaded from Streamlit ZIP to GitHub Direct Pusher",
+                new_repo_private=settings["new_repo_private"],
             )
-            default_branch = repo.get("default_branch", "unknown")
-            visibility = "private" if repo.get("private") else "public"
-            st.success(f"Connected to {settings['owner']}/{settings['repo']} ({visibility}). Default branch: {default_branch}.")
-            st.link_button("Open repository", repo.get("html_url", f"https://github.com/{settings['owner']}/{settings['repo']}"))
+            state = client.get_branch_state(
+                settings["branch"],
+                repo_info,
+                create_branch_if_missing=settings["create_branch_if_missing"],
+            )
+            visibility = "private" if repo_info.get("private") else "public"
+            branch_status = "exists" if state.ref_exists else "will be created / initialized"
+            st.success(
+                f"Connected as {user.get('login')}. Repo {settings['owner']}/{settings['repo']} is {visibility}. Branch {settings['branch']} {branch_status}."
+            )
+            st.link_button("Open repo", repo_info.get("html_url", f"https://github.com/{settings['owner']}/{settings['repo']}"))
         except Exception as exc:
             st.error(str(exc))
 
 
-def help_page() -> None:
-    st.subheader("Setup")
+def help_tab() -> None:
+    st.header("How to use")
     st.markdown(
         """
-### What this app does
-This is a direct project uploader. The normal flow is:
-
+### Fast workflow
 1. Put your GitHub token, owner, repo, branch, and target folder in the sidebar.
-2. Upload a `.zip` project.
-3. Click **Upload ZIP to GitHub now**.
-4. The app extracts the ZIP, skips junk/secrets, creates Git blobs, creates one tree, creates one commit, and moves the branch to that commit.
+2. Upload a `.zip` file.
+3. Click **Upload ZIP directly to GitHub**.
 
-### GitHub token
-Use a fine-grained personal access token with access to the repo you want to update. For normal uploading, grant **Contents: Read and write**. To create repositories from the app, the token must also be allowed to create repos for your account or organization.
+### Token permissions
+For an existing repo, your fine-grained GitHub token needs:
 
-### Good ZIP structure
-Your ZIP can contain a folder like this:
+- Repository access to the target repo
+- **Contents: Read and write**
 
-```text
-my-app/
-  app.py
-  requirements.txt
-  README.md
-  .streamlit/
-    config.toml
-```
+To create a repo from the app, the token also needs permission to create repositories for your user or organization.
 
-With **Remove top ZIP folder** turned on, it uploads as:
+### Upload engines
+- **Compatibility mode - most reliable**: uploads through GitHub's repository contents endpoint. Best for fixing failed uploads and empty/new repos.
+- **Single commit mode - faster**: creates Git blobs, one Git tree, one commit, then updates the branch. Best for larger projects when you want one clean commit.
 
-```text
-app.py
-requirements.txt
-README.md
-.streamlit/config.toml
-```
-
-### Files skipped by default
-The app skips `.git`, `node_modules`, virtual environments, Python caches, build folders, `.env`, `.streamlit/secrets.toml`, and common credential-looking files. Keep that on for safer uploads.
-
-### Replace mode
-Use **Delete old files in target folder before upload** only when you want the GitHub folder to exactly match the ZIP. It requires typing `CLEAN` in the sidebar.
+### Safe defaults
+The app skips `.git`, `node_modules`, virtual environments, Python cache files, `.env`, `.streamlit/secrets.toml`, and common credential-looking files.
         """
     )
 
 
 def main() -> None:
-    st.set_page_config(page_title="Direct ZIP → GitHub", page_icon="🚀", layout="wide")
+    st.set_page_config(page_title="Direct ZIP to GitHub", page_icon="⬆️", layout="wide")
+    settings = sidebar()
+    st.title("Direct ZIP → GitHub Uploader")
+    st.caption(f"Version {APP_VERSION} · Direct upload, no code-review step")
 
-    st.title("🚀 Direct ZIP → GitHub Uploader")
-    st.caption(f"Version {APP_VERSION} · one-click ZIP extraction and GitHub commit")
-    st.write("No code review step. Upload the ZIP and push the project straight to GitHub from the browser.")
-
-    settings = sidebar_settings()
-
-    tab_zip, tab_files, tab_test, tab_help = st.tabs(["ZIP → GitHub", "Files / Folder", "Test", "Help"])
+    tab_zip, tab_files, tab_connection, tab_help = st.tabs(["Direct ZIP", "Files / Folder", "Connection", "Help"])
     with tab_zip:
-        direct_zip_page(settings)
+        direct_zip_tab(settings)
     with tab_files:
-        folder_file_page(settings)
-    with tab_test:
-        connection_page(settings)
+        files_tab(settings)
+    with tab_connection:
+        connection_tab(settings)
     with tab_help:
-        help_page()
+        help_tab()
 
 
 if __name__ == "__main__":
